@@ -29,7 +29,8 @@ from typing import Any
 
 import requests
 
-SEMGREP_API = "https://semgrep.dev/api/v1"
+SEMGREP_BASE = "https://semgrep.dev"
+SEMGREP_API = f"{SEMGREP_BASE}/api/v1"
 DEPS_DEV_API = "https://api.deps.dev/v3alpha"
 EOL_DEP_TAG = "EOL DEP"
 EXPORT_CONCURRENCY = 50
@@ -90,10 +91,9 @@ def list_all_projects(token: str, deployment_slug: str) -> list[dict[str, Any]]:
 
 def create_sbom_export(token: str, deployment_id: int, repository_id: int) -> str:
     resp = requests.post(
-        f"{SEMGREP_API}/deployments/{deployment_id}/sbom/export",
+        f"{SEMGREP_BASE}/api/sca/deployments/{deployment_id}/sbom_async",
         headers=_headers(token),
         json={
-            "deploymentId": deployment_id,
             "repositoryId": repository_id,
             "formatVersion": {"format": "SBOM_FORMAT_CYCLONEDX", "version": "1.5"},
             "sbomOutputFormat": "SBOM_OUTPUT_FORMAT_JSON",
@@ -101,32 +101,28 @@ def create_sbom_export(token: str, deployment_id: int, repository_id: int) -> st
         timeout=30,
     )
     resp.raise_for_status()
-    return resp.json()["taskToken"]
+    return resp.json()["taskTokenJwt"]
 
 
-def poll_sbom_export(token: str, deployment_id: int, task_token: str) -> str:
+def poll_sbom_export(token: str, task_token_jwt: str) -> dict[str, Any]:
+    """Poll the v2 task endpoint; return parsed SBOM dict when complete."""
     deadline = time.monotonic() + POLL_TIMEOUT_S
     while time.monotonic() < deadline:
         resp = requests.get(
-            f"{SEMGREP_API}/deployments/{deployment_id}/sbom/export/{task_token}",
+            f"{SEMGREP_BASE}/api/tasks/v2/{task_token_jwt}",
             headers=_headers(token),
             timeout=30,
         )
         resp.raise_for_status()
         data = resp.json()
-        status = data["status"]
-        if status == "SBOM_EXPORT_STATUS_COMPLETED":
-            return data["downloadUrl"]
-        if status == "SBOM_EXPORT_STATUS_FAILED":
-            raise RuntimeError(f"SBOM export failed: {data.get('errorMessage', 'unknown')}")
+        status = data.get("status", "")
+        if status == "TASK_STATUS_COMPLETED":
+            result_string = data.get("taskResult", {}).get("resultString", "")
+            return json.loads(result_string)
+        if status == "TASK_STATUS_FAILED":
+            raise RuntimeError(f"SBOM export failed: {data.get('error', 'unknown')}")
         time.sleep(POLL_INTERVAL_S)
     raise TimeoutError(f"SBOM export timed out after {POLL_TIMEOUT_S}s")
-
-
-def download_sbom(download_url: str) -> dict[str, Any]:
-    resp = requests.get(download_url, timeout=60)
-    resp.raise_for_status()
-    return resp.json()
 
 
 def add_tag(token: str, deployment_slug: str, project_name: str) -> None:
@@ -235,9 +231,8 @@ def process_project(
     result: dict[str, Any] = {"project": name, "status": "ok", "deprecated_deps": []}
 
     try:
-        task_token = create_sbom_export(token, deployment_id, repo_id)
-        download_url = poll_sbom_export(token, deployment_id, task_token)
-        sbom = download_sbom(download_url)
+        task_token_jwt = create_sbom_export(token, deployment_id, repo_id)
+        sbom = poll_sbom_export(token, task_token_jwt)
     except Exception as exc:
         result["status"] = "sbom_failed"
         result["error"] = str(exc)
